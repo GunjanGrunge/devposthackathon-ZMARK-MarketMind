@@ -1,4 +1,13 @@
-from app.services.scratchpad import save_artifact, get_artifact, delete_session_artifacts
+import pytest
+from app.services.scratchpad import save_artifact, get_artifact, delete_session_artifacts, _store
+
+
+@pytest.fixture(autouse=True)
+def clear_store():
+    """Clear the global _store before and after each test for isolation."""
+    _store.clear()
+    yield
+    _store.clear()
 
 
 def test_save_and_get_artifact():
