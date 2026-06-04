@@ -36,6 +36,8 @@ class AgentState(TypedDict, total=False):
     followups: List[str]
     suggested_followups: List[str]
     error: Optional[str]
+    scratchpad_link: Optional[str]          # new
+    clarification_form: Optional[Dict[str, Any]]   # new
 
 
 def _find_col(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
@@ -661,6 +663,80 @@ STAT_AGENTS = [
 ]
 
 
+def _generate_chart_code(query: str, df: pd.DataFrame, data_summary: str) -> Optional[str]:
+    """Ask Gemini to write safe Plotly chart code for the given query."""
+    if not settings.gemini_api_key:
+        return _fallback_chart_code(query, df)
+
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=settings.gemini_api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+
+        col_info = f"Columns: {', '.join(df.columns.tolist())}\nSample rows:\n{df.head(3).to_string(index=False)}"
+        prompt = f"""Write Python code to answer this visualization request: "{query}"
+
+DataFrame variable name: `df`
+{col_info}
+
+Rules:
+- Import only from: pandas, numpy, plotly.express, plotly.graph_objects
+- Assign the final figure to `fig`
+- Assign a 1-2 sentence plain-English summary to `summary` (no markdown, no em-dashes)
+- Do NOT call fig.show()
+- Filter df to the relevant product/column if mentioned in the request
+- Use a dark-friendly Plotly template: template="plotly_dark"
+
+Return ONLY the Python code block, no explanation."""
+
+        response = model.generate_content(prompt, generation_config={"temperature": 0.1, "max_output_tokens": 600})
+        raw = (response.text or "").strip()
+        raw = re.sub(r"^```python\s*", "", raw)
+        raw = re.sub(r"^```\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return raw.strip()
+    except Exception as exc:
+        logger.warning("Chart code generation failed: %s", exc)
+        return _fallback_chart_code(query, df)
+
+
+def _fallback_chart_code(query: str, df: pd.DataFrame) -> Optional[str]:
+    """Generate a basic histogram/bar chart without Gemini."""
+    product_col = _find_col(df, ["product", "item", "sku", "name"])
+    revenue_col = _find_col(df, ["revenue", "sales", "amount", "total", "price"])
+    if not revenue_col:
+        return None
+
+    if product_col and re.search(r"bar|by product|product", query, re.I):
+        return f"""import plotly.express as px
+grouped = df.groupby("{product_col}")["{revenue_col}"].sum().reset_index()
+fig = px.bar(grouped, x="{product_col}", y="{revenue_col}", title="Revenue by Product", template="plotly_dark")
+summary = "Bar chart showing total revenue for each product."
+"""
+    return f"""import plotly.express as px
+fig = px.histogram(df, x="{revenue_col}", nbins=20, title="{revenue_col.title()} Distribution", template="plotly_dark")
+summary = "Histogram showing the distribution of {revenue_col}."
+"""
+
+
+def _detect_chart_type(query: str) -> str:
+    q = query.lower()
+    if "histogram" in q:
+        return "histogram"
+    if "scatter" in q:
+        return "scatter"
+    if re.search(r"line|trend|over time", q):
+        return "line"
+    return "bar"
+
+
+def _extract_chart_title(query: str) -> str:
+    q = query.strip().rstrip("?")
+    q = re.sub(r"^(can you |could you |please |show me |give me |create |make |generate |draw )", "", q, flags=re.I)
+    return q[:60].title()
+
+
 def load_data_node(state: AgentState) -> AgentState:
     frames = _load_session_dataframes(state["session_id"])
     state["dataframes"] = frames
@@ -669,11 +745,34 @@ def load_data_node(state: AgentState) -> AgentState:
 
 
 def classify_node(state: AgentState) -> AgentState:
-    query = state["query"]
+    query = state["query"].lower()
+
+    # Hypothesis test — must come before generic stats
+    if re.search(
+        r"hypothesis|t.?test|anova|chi.?square|p.?value|significance|statistical test|null hypothesis",
+        query, re.I
+    ):
+        # Check if the user already submitted a clarification form response
+        if re.search(r"metric=|group_a=|alpha=", query):
+            state["route"] = "hypothesis_run"
+        else:
+            state["route"] = "hypothesis_clarify"
+        return state
+
+    # Visualization requests
+    if re.search(
+        r"histogram|bar chart|line chart|scatter|plot|chart|graph|visuali[sz]e|show me a|draw",
+        query, re.I
+    ):
+        state["route"] = "visualization"
+        return state
+
+    # Document / policy retrieval
     if re.search(r"regulation|policy|compliance|pdf|document|clause|packaging", query, re.I):
         state["route"] = "retrieval"
-    else:
-        state["route"] = "statistics"
+        return state
+
+    state["route"] = "statistics"
     return state
 
 
@@ -706,6 +805,188 @@ def retrieval_node(state: AgentState) -> AgentState:
     if not docs:
         docs = _local_pdf_search(state["session_id"], state["query"], top_k=10)
     state["retrieved_docs"] = docs
+    return state
+
+
+def visualization_node(state: AgentState) -> AgentState:
+    from app.services.sandbox import run_chart_code
+    from app.services.scratchpad import save_artifact
+
+    query = state["query"]
+    session_id = state["session_id"]
+    _, df = _combined_frame(state.get("dataframes", []))
+
+    if df is None:
+        state["answer"] = "Upload a CSV or Excel file first so I have data to chart."
+        state["citations"] = []
+        return state
+
+    code = _generate_chart_code(query, df, state.get("data_summary", ""))
+    if not code:
+        state["answer"] = "I could not generate chart code for that request. Try rephrasing, for example: show me a histogram of RTX 3050 sales."
+        state["citations"] = []
+        return state
+
+    result = run_chart_code(code, df)
+    if not result["ok"]:
+        state["answer"] = f"The chart ran into an issue: {result['error']}. Please try a simpler request."
+        state["citations"] = []
+        return state
+
+    title = _extract_chart_title(query)
+    artifact = {
+        "type": _detect_chart_type(query),
+        "title": title,
+        "chart": result["chart"],
+        "summary": result["summary"],
+        "metadata": {"query": query},
+    }
+    report_id = save_artifact(session_id, artifact)
+    state["scratchpad_link"] = f"/scratchpad/{session_id}/{report_id}"
+    state["answer"] = f"Here is your {title.lower()}."
+    state["citations"] = []
+    return state
+
+
+def hypothesis_clarify_node(state: AgentState) -> AgentState:
+    _, df = _combined_frame(state.get("dataframes", []))
+
+    metric_options = []
+    group_options = []
+
+    if df is not None:
+        for col in df.columns:
+            c = col.lower()
+            if any(k in c for k in ["revenue", "sales", "units", "price", "amount"]):
+                metric_options.append({"value": col, "label": col.replace("_", " ").title()})
+        category_col = _find_col(df, ["category", "cat", "group", "type"])
+        if category_col:
+            uniq = df[category_col].dropna().unique().tolist()
+            group_options = [{"value": str(v), "label": str(v)} for v in sorted(uniq)[:8]]
+
+    if not metric_options:
+        metric_options = [{"value": "revenue", "label": "Revenue"}, {"value": "units_sold", "label": "Units Sold"}]
+    if not group_options:
+        group_options = [{"value": "Group A", "label": "Group A"}, {"value": "Group B", "label": "Group B"}]
+
+    state["clarification_form"] = {
+        "intent": "hypothesis_test",
+        "submit_label": "Run Test",
+        "fields": [
+            {
+                "id": "metric",
+                "type": "select",
+                "label": "Metric to test",
+                "options": metric_options,
+                "default": metric_options[0]["value"],
+            },
+            {
+                "id": "group_a",
+                "type": "select",
+                "label": "Group A",
+                "options": group_options,
+                "default": group_options[0]["value"],
+            },
+            {
+                "id": "group_b",
+                "type": "select",
+                "label": "Group B",
+                "options": group_options[1:] if len(group_options) > 1 else group_options,
+                "default": group_options[1]["value"] if len(group_options) > 1 else group_options[0]["value"],
+            },
+            {
+                "id": "alpha",
+                "type": "select",
+                "label": "Significance level",
+                "options": [
+                    {"value": "0.01", "label": "0.01 (strict)"},
+                    {"value": "0.05", "label": "0.05 (standard)"},
+                    {"value": "0.10", "label": "0.10 (lenient)"},
+                ],
+                "default": "0.05",
+            },
+        ],
+    }
+    state["answer"] = "I can run a hypothesis test on your data. A few quick details:"
+    state["citations"] = []
+    return state
+
+
+def hypothesis_run_node(state: AgentState) -> AgentState:
+    from app.services.sandbox import run_chart_code
+    from app.services.scratchpad import save_artifact
+
+    query = state["query"]
+    session_id = state["session_id"]
+    _, df = _combined_frame(state.get("dataframes", []))
+
+    if df is None:
+        state["answer"] = "Upload a CSV or Excel file first."
+        state["citations"] = []
+        return state
+
+    params = dict(re.findall(r"(\w+)=([^,]+)", query))
+    metric = params.get("metric", "revenue").strip()
+    group_a = params.get("group_a", "").strip()
+    group_b = params.get("group_b", "").strip()
+    alpha = float(params.get("alpha", "0.05").strip())
+
+    category_col = _find_col(df, ["category", "cat", "group", "type"])
+    metric_col = _find_col(df, [metric.lower()]) or metric
+
+    code = f"""import plotly.graph_objects as go
+from scipy import stats
+import numpy as np
+
+cat_col = "{category_col or 'category'}"
+metric_col = "{metric_col}"
+group_a = "{group_a}"
+group_b = "{group_b}"
+alpha = {alpha}
+
+a_data = df[df[cat_col] == group_a][metric_col].dropna().astype(float).values
+b_data = df[df[cat_col] == group_b][metric_col].dropna().astype(float).values
+
+t_stat, p_value = stats.ttest_ind(a_data, b_data, equal_var=False)
+reject = p_value < alpha
+
+fig = go.Figure()
+fig.add_trace(go.Box(y=a_data, name=group_a, marker_color="#7c3aed"))
+fig.add_trace(go.Box(y=b_data, name=group_b, marker_color="#0ea5e9"))
+fig.update_layout(
+    title=f"Hypothesis Test: {{group_a}} vs {{group_b}} on {{metric_col}}",
+    template="plotly_dark",
+    yaxis_title=metric_col,
+)
+
+verdict = "Reject the null hypothesis" if reject else "Fail to reject the null hypothesis"
+summary = (
+    f"t-statistic: {{t_stat:.4f}}, p-value: {{p_value:.4f}} (alpha={{alpha}}). "
+    f"{{verdict}}. "
+    f"{{group_a}} mean: {{a_data.mean():.2f}}, {{group_b}} mean: {{b_data.mean():.2f}}. "
+    f"The difference is {{'statistically significant' if reject else 'not statistically significant'}} "
+    f"at the {{alpha}} level."
+)
+"""
+
+    result = run_chart_code(code, df)
+    if not result["ok"]:
+        state["answer"] = f"Test failed: {result['error']}"
+        state["citations"] = []
+        return state
+
+    title = f"Hypothesis Test: {group_a} vs {group_b} on {metric}"
+    artifact = {
+        "type": "hypothesis_report",
+        "title": title,
+        "chart": result["chart"],
+        "summary": result["summary"],
+        "metadata": {"metric": metric, "group_a": group_a, "group_b": group_b, "alpha": alpha},
+    }
+    report_id = save_artifact(session_id, artifact)
+    state["scratchpad_link"] = f"/scratchpad/{session_id}/{report_id}"
+    state["answer"] = result["summary"]
+    state["citations"] = []
     return state
 
 
@@ -974,6 +1255,9 @@ def _build_graph():
     graph.add_node("classify", classify_node)
     graph.add_node("statistics", statistics_node)
     graph.add_node("retrieval", retrieval_node)
+    graph.add_node("visualization", visualization_node)
+    graph.add_node("hypothesis_clarify", hypothesis_clarify_node)
+    graph.add_node("hypothesis_run", hypothesis_run_node)
     graph.add_node("synthesis", synthesis_node)
     graph.add_node("followup", followup_node)
 
@@ -985,12 +1269,18 @@ def _build_graph():
         {
             "statistics": "statistics",
             "retrieval": "retrieval",
+            "visualization": "visualization",
+            "hypothesis_clarify": "hypothesis_clarify",
+            "hypothesis_run": "hypothesis_run",
         },
     )
     graph.add_edge("statistics", "retrieval")
     graph.add_edge("retrieval", "synthesis")
     graph.add_edge("synthesis", "followup")
     graph.add_edge("followup", END)
+    graph.add_edge("visualization", END)
+    graph.add_edge("hypothesis_clarify", END)
+    graph.add_edge("hypothesis_run", END)
     return graph.compile()
 
 
@@ -1037,4 +1327,6 @@ async def answer_query_graph(
         content=result.get("answer") or "I couldn't find relevant data in your uploaded files for this question.",
         citations=citations,
         followups=result.get("followups") or None,
+        scratchpad_link=result.get("scratchpad_link") or None,
+        clarification_form=result.get("clarification_form") or None,
     )
