@@ -20,3 +20,18 @@ def test_dangerous_import_is_blocked():
     code = "import os; os.system('rm -rf /')\nfig = None\nsummary = ''"
     result = run_chart_code(code, df)
     assert result["ok"] is False
+
+
+def test_missing_fig_returns_error():
+    df = pd.DataFrame({"x": [1, 2]})
+    code = "summary = 'no chart here'"  # no fig assignment
+    result = run_chart_code(code, df)
+    assert result["ok"] is False
+    assert "fig" in result["error"].lower()
+
+
+def test_non_plotly_fig_is_rejected():
+    df = pd.DataFrame({"x": [1]})
+    code = "fig = {'fake': 'dict'}\nsummary = ''"
+    result = run_chart_code(code, df)
+    assert result["ok"] is False

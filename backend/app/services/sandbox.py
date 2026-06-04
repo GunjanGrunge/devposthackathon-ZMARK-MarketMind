@@ -32,7 +32,8 @@ def run_chart_code(code: str, df: pd.DataFrame) -> Dict[str, Any]:
     import builtins
     safe_builtins = {
         k: v for k, v in vars(builtins).items()
-        if k not in ("open", "exec", "eval", "compile", "breakpoint", "__import__")
+        if k not in ("open", "exec", "eval", "compile", "breakpoint", "__import__",
+                     "getattr", "setattr", "delattr", "vars", "dir", "type", "object")
     }
     safe_builtins["__import__"] = _safe_import
 
@@ -54,6 +55,9 @@ def run_chart_code(code: str, df: pd.DataFrame) -> Dict[str, Any]:
         return {"ok": False, "error": "Code did not produce a `fig` variable.", "chart": None, "summary": summary}
 
     try:
+        from plotly.basedatatypes import BaseFigure
+        if not isinstance(fig, BaseFigure):
+            return {"ok": False, "error": "The `fig` variable must be a Plotly Figure.", "chart": None, "summary": summary}
         chart_json = fig.to_dict()
         return {"ok": True, "chart": chart_json, "summary": summary}
     except Exception as exc:
