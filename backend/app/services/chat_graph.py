@@ -675,7 +675,8 @@ def _generate_chart_code(query: str, df: pd.DataFrame, data_summary: str) -> Opt
         model = genai.GenerativeModel("gemini-2.5-flash")
 
         col_info = f"Columns: {', '.join(df.columns.tolist())}\nSample rows:\n{df.head(3).to_string(index=False)}"
-        prompt = f"""Write Python code to answer this visualization request: "{query}"
+        sanitized_query = query.replace('"', "'").replace('\\', '')
+        prompt = f"""Write Python code to answer this visualization request: "{sanitized_query}"
 
 DataFrame variable name: `df`
 {col_info}
@@ -745,7 +746,7 @@ def load_data_node(state: AgentState) -> AgentState:
 
 
 def classify_node(state: AgentState) -> AgentState:
-    query = state["query"].lower()
+    query = state["query"]
 
     # Hypothesis test — must come before generic stats
     if re.search(
@@ -925,20 +926,32 @@ def hypothesis_run_node(state: AgentState) -> AgentState:
         state["citations"] = []
         return state
 
-    params = dict(re.findall(r"(\w+)=([^,]+)", query))
+    params = dict(re.findall(r"(\w+)=([^\s,]+)", query))
     metric = params.get("metric", "revenue").strip()
     group_a = params.get("group_a", "").strip()
     group_b = params.get("group_b", "").strip()
-    alpha = float(params.get("alpha", "0.05").strip())
+    try:
+        alpha = float(params.get("alpha", "0.05").strip())
+    except ValueError:
+        alpha = 0.05
 
     category_col = _find_col(df, ["category", "cat", "group", "type"])
     metric_col = _find_col(df, [metric.lower()]) or metric
+
+    import re as _re
+    def _safe_str(s: str) -> str:
+        return _re.sub(r"[^a-zA-Z0-9 _\-\.]", "", s)
+
+    group_a = _safe_str(group_a)
+    group_b = _safe_str(group_b)
+    metric_col = _safe_str(metric_col)
+    safe_cat_col = _safe_str(category_col or "category")
 
     code = f"""import plotly.graph_objects as go
 from scipy import stats
 import numpy as np
 
-cat_col = "{category_col or 'category'}"
+cat_col = "{safe_cat_col}"
 metric_col = "{metric_col}"
 group_a = "{group_a}"
 group_b = "{group_b}"
@@ -1278,9 +1291,9 @@ def _build_graph():
     graph.add_edge("retrieval", "synthesis")
     graph.add_edge("synthesis", "followup")
     graph.add_edge("followup", END)
-    graph.add_edge("visualization", END)
+    graph.add_edge("visualization", "followup")
+    graph.add_edge("hypothesis_run", "followup")
     graph.add_edge("hypothesis_clarify", END)
-    graph.add_edge("hypothesis_run", END)
     return graph.compile()
 
 
