@@ -10,6 +10,7 @@ export function ScratchpadPage() {
   const [artifact, setArtifact] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
+  const isDark = document.documentElement.getAttribute("data-theme") !== "light";
 
   useEffect(() => {
     if (!sessionId || !reportId) {
@@ -75,7 +76,7 @@ export function ScratchpadPage() {
                     ...(artifact.chart.layout || {}),
                     paper_bgcolor: "transparent",
                     plot_bgcolor: "transparent",
-                    font: { color: "#e2e2f0", family: "Inter, sans-serif" },
+                    font: { color: isDark ? "#eef1f6" : "#14181f", family: "IBM Plex Sans, sans-serif" },
                     margin: { t: 48, b: 48, l: 56, r: 24 },
                     autosize: true,
                   }}

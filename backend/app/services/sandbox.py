@@ -2,10 +2,11 @@
 Safe Python sandbox for LLM-generated chart and analysis code.
 
 Allows only pandas, numpy, plotly, scipy, math, and statistics imports.
-Strips write-capable builtins. Code must assign `fig` (Plotly Figure) and
-optionally `summary` (str).
+Strips write-capable builtins. Chart code must assign `fig` (Plotly Figure)
+and optionally `summary` (str). Analysis code must assign `result` (dict).
 """
 from __future__ import annotations
+import json
 import logging
 from typing import Any, Dict
 import pandas as pd
@@ -56,9 +57,41 @@ def run_chart_code(code: str, df: pd.DataFrame) -> Dict[str, Any]:
 
     try:
         from plotly.basedatatypes import BaseFigure
+        from plotly.utils import PlotlyJSONEncoder
         if not isinstance(fig, BaseFigure):
             return {"ok": False, "error": "The `fig` variable must be a Plotly Figure.", "chart": None, "summary": summary}
-        chart_json = fig.to_dict()
+        chart_json = json.loads(json.dumps(fig.to_dict(), cls=PlotlyJSONEncoder))
         return {"ok": True, "chart": chart_json, "summary": summary}
     except Exception as exc:
         return {"ok": False, "error": f"Failed to serialize figure: {exc}", "chart": None, "summary": summary}
+
+
+def run_analysis_code(code: str, df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Execute LLM-generated analytical code in the same restricted namespace.
+    Code must assign `result` to a JSON-serializable dict.
+    """
+    import builtins
+    safe_builtins = {
+        k: v for k, v in vars(builtins).items()
+        if k not in ("open", "exec", "eval", "compile", "breakpoint", "__import__",
+                     "getattr", "setattr", "delattr", "vars", "dir", "type", "object")
+    }
+    safe_builtins["__import__"] = _safe_import
+
+    namespace: Dict[str, Any] = {
+        "__builtins__": safe_builtins,
+        "df": df.copy(),
+    }
+
+    try:
+        exec(compile(code, "<analysis_sandbox>", "exec"), namespace)  # noqa: S102
+    except Exception as exc:
+        logger.warning("Analysis sandbox exec error: %s", exc)
+        return {"ok": False, "error": str(exc), "result": None}
+
+    result = namespace.get("result")
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "Code did not produce a `result` dict.", "result": None}
+
+    return {"ok": True, "error": "", "result": result}

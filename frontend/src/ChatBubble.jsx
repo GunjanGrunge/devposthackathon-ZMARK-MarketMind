@@ -19,6 +19,9 @@ function renderContentWithCitations(content) {
 
 export function ChatBubble({ message, sessionId, onFollowup }) {
   const isAssistant = message.role === "assistant";
+  const scratchpadHref = message.scratchpad_link?.startsWith("/scratchpad/")
+    ? `/ui${message.scratchpad_link}`
+    : message.scratchpad_link;
 
   return (
     <div className={`chat-bubble ${isAssistant ? "assistant" : "user"}`}>
@@ -27,9 +30,9 @@ export function ChatBubble({ message, sessionId, onFollowup }) {
           {renderContentWithCitations(message.content)}
         </p>
 
-        {message.scratchpad_link && (
+        {scratchpadHref && (
           <a
-            href={message.scratchpad_link}
+            href={scratchpadHref}
             target="_blank"
             rel="noopener noreferrer"
             className="scratchpad-link-card"

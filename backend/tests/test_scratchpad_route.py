@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+import numpy as np
 from app.main import app
 from app.services.scratchpad import save_artifact, _store
 
@@ -33,3 +34,26 @@ def test_get_missing_artifact_returns_404():
 
     resp = client.get("/api/v1/scratchpad/sess-route-001/rpt_missing")
     assert resp.status_code == 404
+
+
+def test_get_artifact_serializes_plotly_numpy_payload():
+    _store.clear()
+    artifact = {
+        "type": "pie",
+        "title": "Revenue by Channel",
+        "chart": {
+            "data": [{"type": "pie", "labels": np.array(["Online", "Retail"]), "values": np.array([100, 50])}],
+            "layout": {},
+        },
+        "summary": "Test",
+        "metadata": {},
+    }
+    report_id = save_artifact("sess-route-numpy", artifact)
+
+    resp = client.get(f"/api/v1/scratchpad/sess-route-numpy/{report_id}")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["chart"]["data"][0]["labels"] == ["Online", "Retail"]
+    assert data["chart"]["data"][0]["values"] == [100, 50]
+    _store.clear()

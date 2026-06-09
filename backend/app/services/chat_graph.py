@@ -9,15 +9,25 @@ session_store or retrieved session documents.
 from __future__ import annotations
 
 import logging
+import json
 import re
 from typing import Any, Dict, List, Optional, TypedDict
 
+import numpy as np
 import pandas as pd
 
 from app.core.config import settings
 from app.schemas.analytics import ChatMessage, Citation
 from app.services.eda import ensure_session_loaded, session_store, store_lock
-from app.services.analytics import _compute_product_risk, _find_col as _analytics_find_col
+from app.services.analytics import (
+    _compute_product_risk,
+    _find_category_col,
+    _find_channel_col,
+    _find_date_col,
+    _find_product_col,
+    _find_revenue_col,
+    _find_units_col,
+)
 
 logger = logging.getLogger("chat_graph")
 
@@ -28,6 +38,7 @@ class AgentState(TypedDict, total=False):
     history: List[Dict[str, str]]
     dataframes: List[Dict[str, Any]]
     data_summary: str               # text snapshot of uploaded data for Gemini context
+    analysis_context: Dict[str, Any]
     route: str
     stats_results: List[Dict[str, Any]]
     retrieved_docs: List[Dict[str, Any]]
@@ -41,6 +52,31 @@ class AgentState(TypedDict, total=False):
 
 
 def _find_col(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
+    keyword_text = " ".join(keywords).lower()
+    if any(token in keyword_text for token in ["revenue", "sales", "amount", "total", "price", "gmv", "profit"]):
+        found = _find_revenue_col(df)
+        if found:
+            return found
+    if any(token in keyword_text for token in ["date", "time", "timestamp", "month", "period"]):
+        found = _find_date_col(df)
+        if found:
+            return found
+    if any(token in keyword_text for token in ["product", "item", "sku", "name", "title"]):
+        found = _find_product_col(df)
+        if found:
+            return found
+    if any(token in keyword_text for token in ["unit", "qty", "quantity", "sold", "volume"]):
+        found = _find_units_col(df)
+        if found:
+            return found
+    if any(token in keyword_text for token in ["channel", "source", "platform", "store", "market", "region"]):
+        found = _find_channel_col(df)
+        if found:
+            return found
+    if any(token in keyword_text for token in ["category", "cat", "group", "type", "segment", "department"]):
+        found = _find_category_col(df)
+        if found:
+            return found
     for keyword in keywords:
         for col in df.columns:
             if keyword in col.lower():
@@ -213,6 +249,172 @@ def _format_metric(value: float, metric_col: str, operation: str) -> str:
     if operation == "count":
         return f"{value:,.0f}"
     return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+
+STATISTICAL_OPERATIONS = {
+    "std": {
+        "label": "sample standard deviation",
+        "patterns": [
+            r"\bstd\b", r"\bstd\.?\s*dev\b", r"\bstandard\s+deviation\b",
+            r"\bspread\b", r"\bdispersion\b", r"\bvolatility\b",
+        ],
+    },
+    "var": {
+        "label": "sample variance",
+        "patterns": [r"\bvariance\b", r"\bvar\b"],
+    },
+    "mean": {
+        "label": "mean",
+        "patterns": [r"\bmean\b", r"\baverage\b", r"\bavg\b"],
+    },
+    "median": {
+        "label": "median",
+        "patterns": [r"\bmedian\b", r"\bmidpoint\b"],
+    },
+    "min": {
+        "label": "minimum",
+        "patterns": [r"\bminimum\b", r"\bmin\b", r"\blowest\b", r"\bsmallest\b"],
+    },
+    "max": {
+        "label": "maximum",
+        "patterns": [r"\bmaximum\b", r"\bmax\b", r"\bhighest\b", r"\blargest\b"],
+    },
+    "sum": {
+        "label": "total",
+        "patterns": [r"\btotal\b", r"\bsum\b", r"\boverall\b"],
+    },
+    "count": {
+        "label": "count",
+        "patterns": [r"\bcount\b", r"\bhow many\b", r"\bnumber of\b"],
+    },
+}
+
+
+def _detect_statistical_operation(query: str) -> Optional[str]:
+    for operation, spec in STATISTICAL_OPERATIONS.items():
+        if any(re.search(pattern, query, re.I) for pattern in spec["patterns"]):
+            return operation
+    return None
+
+
+def _infer_metric_column(df: pd.DataFrame, query: str) -> Optional[str]:
+    query_lower = query.lower()
+    candidates: List[str] = []
+    if re.search(r"\bsales|revenue|amount|total|gmv|value|price|profit\b", query_lower):
+        candidates.extend(["sales", "revenue", "amount", "total", "gmv", "value", "price", "profit"])
+    if re.search(r"\bunits?|quantity|qty|sold|volume\b", query_lower):
+        candidates.extend(["units", "unit", "quantity", "qty", "sold", "volume"])
+    candidates.extend(["sales", "revenue", "amount", "total", "price", "units", "qty", "quantity", "sold"])
+    return _find_col(df, candidates)
+
+
+def _infer_group_column(df: pd.DataFrame, query: str) -> Optional[str]:
+    query_lower = query.lower()
+    group_specs = [
+        (["product", "products", "item", "items", "sku", "skus"], ["product", "item", "sku", "name"]),
+        (["category", "categories", "department"], ["category", "subcategory", "department"]),
+        (["channel", "channels", "source", "referralsource", "referral source", "platform"], ["channel", "source", "referral", "platform", "store"]),
+        (["customer", "customers", "client"], ["customer", "client"]),
+        (["region", "state", "city", "country"], ["region", "state", "city", "country"]),
+    ]
+    if not re.search(r"\b(by|per|each|every|across|for each|grouped by|break.*down)\b", query_lower):
+        return None
+    for query_terms, columns in group_specs:
+        if any(term in query_lower for term in query_terms):
+            return _find_col(df, columns)
+    return None
+
+
+def _calculate_stat(values: pd.Series, operation: str) -> float:
+    if operation == "std":
+        return float(values.std(ddof=1))
+    if operation == "var":
+        return float(values.var(ddof=1))
+    if operation == "mean":
+        return float(values.mean())
+    if operation == "median":
+        return float(values.median())
+    if operation == "min":
+        return float(values.min())
+    if operation == "max":
+        return float(values.max())
+    if operation == "count":
+        return float(values.count())
+    return float(values.sum())
+
+
+def _agent_statistical_inference(filename: str, df: pd.DataFrame, query: str) -> Optional[Dict[str, Any]]:
+    """
+    Multi-purpose statistical inference agent for descriptive/statistical questions.
+    It detects the requested statistic and optional grouping dimension from the query
+    instead of relying on one-off product or revenue rules.
+    """
+    operation = _detect_statistical_operation(query)
+    if not operation:
+        return None
+
+    metric_col = _infer_metric_column(df, query)
+    if not metric_col:
+        return None
+
+    scoped_df = df.copy()
+    scoped_df[metric_col] = pd.to_numeric(scoped_df[metric_col], errors="coerce")
+    group_col = _infer_group_column(scoped_df, query)
+    label = STATISTICAL_OPERATIONS[operation]["label"]
+
+    if group_col:
+        grouped = (
+            scoped_df.dropna(subset=[metric_col, group_col])
+            .groupby(group_col)[metric_col]
+            .agg(
+                value=lambda series: _calculate_stat(series, operation),
+                count="count",
+                mean="mean",
+            )
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna(subset=["value"])
+        )
+        if grouped.empty:
+            return None
+        grouped = grouped.sort_values("value", ascending=False)
+        rows = []
+        for name, row in grouped.head(12).iterrows():
+            formatted = _format_metric(float(row["value"]), metric_col, operation)
+            rows.append(f"{name}: {formatted} (n={int(row['count'])})")
+        overflow = "" if len(grouped) <= 12 else f" Showing the top 12 of {len(grouped)} groups by {label}."
+        sentence = (
+            f"The {label} of {metric_col} by {group_col} is: "
+            f"{'; '.join(rows)}.{overflow}"
+        )
+        excerpt = f"{label} of {metric_col} grouped by {group_col}; {len(grouped)} groups"
+        followups = [
+            f"Create a chart of {label} by {group_col}",
+            f"Which {group_col} has the highest variability?",
+            f"Compare mean and {label} by {group_col}",
+        ]
+    else:
+        values = scoped_df[metric_col].dropna()
+        if values.empty:
+            return None
+        value = _calculate_stat(values, operation)
+        formatted = _format_metric(value, metric_col, operation)
+        sentence = (
+            f"The {label} of {metric_col} across the uploaded data is {formatted}, "
+            f"calculated from {len(values):,} rows."
+        )
+        excerpt = f"{label} of {metric_col}: {formatted} from {len(values):,} rows"
+        followups = [
+            f"Break this down by product",
+            f"Break this down by channel",
+            f"Create a distribution chart for {metric_col}",
+        ]
+
+    return {
+        "agent": "statistical_inference_agent",
+        "sentence": sentence,
+        "citation": Citation(source=filename, ref=f"{label} {metric_col}", excerpt=excerpt),
+        "followups": followups,
+    }
 
 
 def _agent_generic_metric(filename: str, df: pd.DataFrame, query: str) -> Optional[Dict[str, Any]]:
@@ -594,6 +796,9 @@ def _agent_product_summary(filename: str, df: pd.DataFrame, query: str) -> Optio
     agent matched. Returns the full product revenue + units leaderboard so Gemini
     always has numbers to work with.
     """
+    if _detect_statistical_operation(query):
+        return None
+
     product_col = _find_col(df, ["product", "item", "sku", "name"])
     revenue_col = _find_col(df, ["revenue", "sales", "amount", "total", "price"])
     units_col = _find_col(df, ["units", "unit", "qty", "quantity", "sold", "volume"])
@@ -658,15 +863,269 @@ STAT_AGENTS = [
     _agent_best_month,             # "what was my best month"
     _agent_at_risk,                # "which products are at risk / should I stop"
     _agent_channel,                # "which channel performs best"
+    _agent_statistical_inference,  # grouped/ungrouped descriptive inference questions
     _agent_generic_metric,         # "what was total/average/max/min X [in month Y]"
     _agent_product_summary,        # catch-all — fires on any remaining product/sales question
 ]
 
 
 def _generate_chart_code(query: str, df: pd.DataFrame, data_summary: str) -> Optional[str]:
-    """Ask Gemini to write safe Plotly chart code for the given query."""
+    """Backward-compatible wrapper around the chart harness code generator."""
+    plan = _plan_chart(query, df, data_summary)
+    return _generate_chart_code_from_plan(query, df, data_summary, plan)
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+
+def _find_mentioned_value(query: str, values: List[Any]) -> Optional[str]:
+    q_norm = _normalize_text(query)
+    best: tuple[int, Optional[str]] = (0, None)
+    for raw in values:
+        value = str(raw)
+        v_norm = _normalize_text(value)
+        if not v_norm:
+            continue
+        if v_norm in q_norm:
+            score = len(v_norm)
+        else:
+            tokens = [token for token in v_norm.split() if len(token) >= 2]
+            matches = sum(1 for token in tokens if token in q_norm)
+            score = matches * 10 if tokens and matches >= max(1, len(tokens) - 1) else 0
+        if score > best[0]:
+            best = (score, value)
+    return best[1]
+
+
+def _fallback_chart_plan(query: str, df: pd.DataFrame) -> Dict[str, Any]:
+    chart_type = _detect_chart_type(query)
+    metric_col = _find_col(df, ["revenue", "sales", "amount", "total", "price", "units", "qty", "quantity", "sold"])
+    product_col = _find_col(df, ["product", "item", "sku", "name"])
+    date_col = _find_col(df, ["date", "time", "month", "period"])
+    category_col = _find_col(df, ["category", "cat", "group", "type"])
+    channel_col = _find_col(df, ["channel", "source", "platform", "store"])
+    numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+
+    dimension_col = None
+    if re.search(r"channel|platform|source|retail|online|marketplace", query, re.I):
+        dimension_col = channel_col
+    elif re.search(r"category|segment|type", query, re.I):
+        dimension_col = category_col
+    elif re.search(r"product|item|sku", query, re.I):
+        dimension_col = product_col
+    elif chart_type == "line":
+        dimension_col = date_col
+    elif chart_type in {"pie", "bar"}:
+        dimension_col = channel_col or category_col or product_col
+
+    filter_col = None
+    filter_value = None
+    if product_col:
+        mentioned = _find_mentioned_value(query, df[product_col].dropna().unique().tolist())
+        if mentioned:
+            filter_col = product_col
+            filter_value = mentioned
+
+    if chart_type == "scatter" and len(numeric_cols) >= 2:
+        metric_col = numeric_cols[1]
+        dimension_col = numeric_cols[0]
+
+    return {
+        "chart_type": chart_type,
+        "metric_col": metric_col,
+        "dimension_col": dimension_col,
+        "filter_col": filter_col,
+        "filter_value": filter_value,
+        "title": _extract_chart_title(query),
+        "reasoning": "Fallback chart plan from query keywords and dataframe schema.",
+    }
+
+
+def _plan_chart(query: str, df: pd.DataFrame, data_summary: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Planner agent: creates a structured chart plan from the user request."""
+    fallback = _fallback_chart_plan(query, df)
     if not settings.gemini_api_key:
-        return _fallback_chart_code(query, df)
+        return fallback
+
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=settings.gemini_api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        product_col = _find_col(df, ["product", "item", "sku", "name"])
+        channel_col = _find_col(df, ["channel", "source", "platform", "store"])
+        category_col = _find_col(df, ["category", "cat", "group", "type"])
+        value_hints = {}
+        for col in [product_col, channel_col, category_col]:
+            if col:
+                value_hints[col] = [str(v) for v in df[col].dropna().unique().tolist()[:30]]
+
+        prompt = f"""You are a visualization planner for a BI chatbot.
+Return only valid JSON.
+
+User request: {query}
+
+Columns: {json.dumps(df.columns.tolist())}
+Candidate values: {json.dumps(value_hints)}
+Data summary:
+{data_summary[:2500]}
+
+Session retrieval context:
+{_context_for_prompt(context, max_chars=3000)}
+
+Choose a plan with these keys:
+chart_type: one of histogram, pie, bar, line, scatter
+metric_col: numeric metric column to plot, or null
+dimension_col: grouping/x-axis column, or null
+filter_col: column to filter, or null
+filter_value: exact value to filter if the user mentions one, or null
+title: short title
+reasoning: one short sentence
+
+Rules:
+- If the user asks for a pie chart, chart_type must be pie.
+- If the user asks for a histogram, chart_type must be histogram even if a product is mentioned.
+- If a product such as NVMe SSD 2TB is mentioned, set filter_col to the product column and filter_value to that exact dataset value.
+- Sales normally maps to revenue unless the user explicitly asks for units sold.
+"""
+        response = model.generate_content(prompt, generation_config={"temperature": 0.05, "max_output_tokens": 450})
+        raw = (response.text or "").strip()
+        raw = re.sub(r"^```json\s*", "", raw)
+        raw = re.sub(r"^```\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        plan = json.loads(raw)
+        merged = {**fallback, **{k: v for k, v in plan.items() if k in fallback or k in {"reasoning"}}}
+
+        if fallback.get("filter_value") and not merged.get("filter_value"):
+            merged["filter_col"] = fallback.get("filter_col")
+            merged["filter_value"] = fallback.get("filter_value")
+        if re.search(r"histo\w*", query, re.I):
+            merged["chart_type"] = "histogram"
+        if re.search(r"pie", query, re.I):
+            merged["chart_type"] = "pie"
+        return merged
+    except Exception as exc:
+        logger.warning("Chart planner failed: %s", exc)
+        return fallback
+
+
+def _context_for_prompt(context: Optional[Dict[str, Any]], max_chars: int = 3000) -> str:
+    if not context:
+        return ""
+    payload = {
+        "files": context.get("files", []),
+        "elastic_docs": [
+            {
+                "source_file": doc.get("source_file"),
+                "row_number": doc.get("row_number"),
+                "page_number": doc.get("page_number"),
+                "doc_type": doc.get("doc_type"),
+                "content": doc.get("content", "")[:500],
+            }
+            for doc in context.get("elastic_docs", [])[:8]
+        ],
+    }
+    return json.dumps(payload, default=str)[:max_chars]
+
+
+def _json_for_code(value: Any) -> str:
+    return json.dumps(value)
+
+
+def _fallback_chart_code_from_plan(plan: Dict[str, Any], df: pd.DataFrame) -> Optional[str]:
+    chart_type = plan.get("chart_type") or "bar"
+    metric_col = plan.get("metric_col") or _find_col(df, ["revenue", "sales", "amount", "total", "price"])
+    dimension_col = plan.get("dimension_col")
+    filter_col = plan.get("filter_col")
+    filter_value = plan.get("filter_value")
+    title = plan.get("title") or "Generated Chart"
+
+    if not metric_col and chart_type != "count":
+        return None
+
+    filter_lines = ""
+    filter_summary = "all rows"
+    if filter_col and filter_value and filter_col in df.columns:
+        filter_lines = (
+            f'plot_df = plot_df[plot_df[{_json_for_code(filter_col)}].astype(str).str.lower() == '
+            f'{_json_for_code(str(filter_value).lower())}]\n'
+        )
+        filter_summary = f"{filter_col} = {filter_value}"
+
+    if chart_type == "pie":
+        if not dimension_col or dimension_col not in df.columns:
+            dimension_col = _find_col(df, ["channel", "category", "product", "item", "sku", "name"])
+        if not dimension_col:
+            return None
+        return f"""import plotly.express as px
+plot_df = df.copy()
+{filter_lines}plot_df[{_json_for_code(metric_col)}] = plot_df[{_json_for_code(metric_col)}].astype(float)
+grouped = plot_df.groupby({_json_for_code(dimension_col)})[{_json_for_code(metric_col)}].sum().reset_index()
+fig = px.pie(grouped, names={_json_for_code(dimension_col)}, values={_json_for_code(metric_col)}, title={_json_for_code(title)}, template="plotly_dark")
+fig.update_traces(textposition="inside", textinfo="percent+label")
+summary = f'Created a pie chart for {{len(grouped)}} segments using {metric_col} with filter {filter_summary}.'
+"""
+
+    if chart_type == "line":
+        if not dimension_col or dimension_col not in df.columns:
+            dimension_col = _find_col(df, ["date", "time", "month", "period"])
+        if not dimension_col:
+            return None
+        return f"""import pandas as pd
+import plotly.express as px
+plot_df = df.copy()
+{filter_lines}plot_df[{_json_for_code(dimension_col)}] = pd.to_datetime(plot_df[{_json_for_code(dimension_col)}], errors="coerce")
+plot_df[{_json_for_code(metric_col)}] = plot_df[{_json_for_code(metric_col)}].astype(float)
+grouped = plot_df.dropna(subset=[{_json_for_code(dimension_col)}]).set_index({_json_for_code(dimension_col)}).resample("ME")[{_json_for_code(metric_col)}].sum().reset_index()
+fig = px.line(grouped, x={_json_for_code(dimension_col)}, y={_json_for_code(metric_col)}, title={_json_for_code(title)}, template="plotly_dark", markers=True)
+summary = f'Created a monthly trend chart over {{len(grouped)}} points using {metric_col} with filter {filter_summary}.'
+"""
+
+    if chart_type == "scatter":
+        numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+        x_col = dimension_col if dimension_col in df.columns else (numeric_cols[0] if numeric_cols else None)
+        y_col = metric_col if metric_col in df.columns else (numeric_cols[1] if len(numeric_cols) > 1 else None)
+        if not x_col or not y_col:
+            return None
+        return f"""import plotly.express as px
+plot_df = df.copy()
+{filter_lines}fig = px.scatter(plot_df, x={_json_for_code(x_col)}, y={_json_for_code(y_col)}, title={_json_for_code(title)}, template="plotly_dark")
+summary = f'Created a scatter plot of {y_col} against {x_col} with {{len(plot_df)}} rows.'
+"""
+
+    if chart_type == "histogram":
+        return f"""import plotly.express as px
+plot_df = df.copy()
+{filter_lines}plot_df[{_json_for_code(metric_col)}] = plot_df[{_json_for_code(metric_col)}].astype(float)
+fig = px.histogram(plot_df, x={_json_for_code(metric_col)}, nbins=12, title={_json_for_code(title)}, template="plotly_dark")
+fig.update_layout(xaxis_title={_json_for_code(metric_col)}, yaxis_title="Count")
+summary = f'Created a histogram of {metric_col} for {{len(plot_df)}} rows with filter {filter_summary}.'
+"""
+
+    if not dimension_col or dimension_col not in df.columns:
+        dimension_col = _find_col(df, ["product", "item", "sku", "name", "channel", "category"])
+    if not dimension_col:
+        return None
+    return f"""import plotly.express as px
+plot_df = df.copy()
+{filter_lines}plot_df[{_json_for_code(metric_col)}] = plot_df[{_json_for_code(metric_col)}].astype(float)
+grouped = plot_df.groupby({_json_for_code(dimension_col)})[{_json_for_code(metric_col)}].sum().reset_index().sort_values({_json_for_code(metric_col)}, ascending=False)
+fig = px.bar(grouped, x={_json_for_code(dimension_col)}, y={_json_for_code(metric_col)}, title={_json_for_code(title)}, template="plotly_dark")
+summary = f'Created a bar chart for {{len(grouped)}} groups using {metric_col} with filter {filter_summary}.'
+"""
+
+
+def _generate_chart_code_from_plan(
+    query: str,
+    df: pd.DataFrame,
+    data_summary: str,
+    plan: Dict[str, Any],
+    context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Coding agent: writes Plotly code from the chart plan, with fallback code if LLM is unavailable."""
+    if not settings.gemini_api_key:
+        return _fallback_chart_code_from_plan(plan, df)
 
     try:
         import google.generativeai as genai
@@ -674,19 +1133,27 @@ def _generate_chart_code(query: str, df: pd.DataFrame, data_summary: str) -> Opt
         genai.configure(api_key=settings.gemini_api_key)
         model = genai.GenerativeModel("gemini-2.5-flash")
 
-        col_info = f"Columns: {', '.join(df.columns.tolist())}\nSample rows:\n{df.head(3).to_string(index=False)}"
+        col_info = f"Columns: {', '.join(df.columns.tolist())}\nSample rows:\n{df.head(5).to_string(index=False)}"
         sanitized_query = query.replace('"', "'").replace('\\', '')
         prompt = f"""Write Python code to answer this visualization request: "{sanitized_query}"
 
 DataFrame variable name: `df`
 {col_info}
+Session context:
+{_context_for_prompt(context, max_chars=3000)}
+
+Structured chart plan:
+{json.dumps(plan)}
 
 Rules:
 - Import only from: pandas, numpy, plotly.express, plotly.graph_objects
 - Assign the final figure to `fig`
 - Assign a 1-2 sentence plain-English summary to `summary` (no markdown, no em-dashes)
 - Do NOT call fig.show()
-- Filter df to the relevant product/column if mentioned in the request
+- Follow the structured chart plan exactly, including chart_type, filter_col, filter_value, metric_col, and dimension_col
+- For pie charts, use px.pie with names and values
+- For histograms, use px.histogram even when a product filter is present
+- If filter_col/filter_value are present, filter df before plotting
 - Use a dark-friendly Plotly template: template="plotly_dark"
 
 Return ONLY the Python code block, no explanation."""
@@ -696,10 +1163,60 @@ Return ONLY the Python code block, no explanation."""
         raw = re.sub(r"^```python\s*", "", raw)
         raw = re.sub(r"^```\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
-        return raw.strip()
+        code = raw.strip()
+        return code or _fallback_chart_code_from_plan(plan, df)
     except Exception as exc:
         logger.warning("Chart code generation failed: %s", exc)
-        return _fallback_chart_code(query, df)
+        return _fallback_chart_code_from_plan(plan, df)
+
+
+def _repair_chart_code(query: str, df: pd.DataFrame, plan: Dict[str, Any], code: str, error: str) -> Optional[str]:
+    """Reviewer/repair agent: fixes generated code after a sandbox failure."""
+    if not settings.gemini_api_key:
+        return _fallback_chart_code_from_plan(plan, df)
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=settings.gemini_api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        prompt = f"""Repair this Plotly code for a restricted sandbox.
+Return only Python code.
+
+User request: {query}
+Chart plan: {json.dumps(plan)}
+Sandbox error: {error}
+Columns: {json.dumps(df.columns.tolist())}
+
+Broken code:
+{code}
+
+Rules:
+- Import only pandas, numpy, plotly.express, plotly.graph_objects.
+- Do not use open, eval, exec, getattr, setattr, type, dir, vars, object.
+- Assign final Plotly figure to fig and plain-English summary to summary.
+"""
+        response = model.generate_content(prompt, generation_config={"temperature": 0.05, "max_output_tokens": 650})
+        raw = (response.text or "").strip()
+        raw = re.sub(r"^```python\s*", "", raw)
+        raw = re.sub(r"^```\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return raw.strip() or _fallback_chart_code_from_plan(plan, df)
+    except Exception as exc:
+        logger.warning("Chart repair failed: %s", exc)
+        return _fallback_chart_code_from_plan(plan, df)
+
+
+def _summarize_chart_result(query: str, plan: Dict[str, Any], result_summary: str) -> str:
+    chart_type = str(plan.get("chart_type") or "chart")
+    title = str(plan.get("title") or _extract_chart_title(query))
+    filter_value = plan.get("filter_value")
+    filter_text = f" for {filter_value}" if filter_value else ""
+    metric = plan.get("metric_col") or "the selected metric"
+    return (
+        f"I created a {chart_type} chart{filter_text} in ZScratchpad. "
+        f"{result_summary or f'The chart uses {metric} from your uploaded data.'} "
+        "Open the scratchpad card to inspect the chart, and I can also explain the pattern or create another view like a pie chart, trend line, or channel breakdown."
+    )
 
 
 def _fallback_chart_code(query: str, df: pd.DataFrame) -> Optional[str]:
@@ -723,7 +1240,9 @@ summary = "Histogram showing the distribution of {revenue_col}."
 
 def _detect_chart_type(query: str) -> str:
     q = query.lower()
-    if "histogram" in q:
+    if "pie" in q:
+        return "pie"
+    if "histogram" in q or "histo" in q:
         return "histogram"
     if "scatter" in q:
         return "scatter"
@@ -739,7 +1258,17 @@ def _extract_chart_title(query: str) -> str:
 
 
 def load_data_node(state: AgentState) -> AgentState:
-    frames = _load_session_dataframes(state["session_id"])
+    try:
+        from app.services.analysis_context import get_analysis_context
+
+        context = get_analysis_context(state["session_id"], query=state["query"])
+        frames = context.get("frames") or _load_session_dataframes(state["session_id"])
+        state["analysis_context"] = context
+        if context.get("elastic_docs") and not state.get("retrieved_docs"):
+            state["retrieved_docs"] = context.get("elastic_docs", [])
+    except Exception as exc:
+        logger.warning("Analysis context load failed: %s", exc)
+        frames = _load_session_dataframes(state["session_id"])
     state["dataframes"] = frames
     state["data_summary"] = _build_data_summary(frames)
     return state
@@ -762,7 +1291,7 @@ def classify_node(state: AgentState) -> AgentState:
 
     # Visualization requests
     if re.search(
-        r"histogram|bar chart|line chart|scatter|plot|chart|graph|visuali[sz]e|show me a|draw",
+        r"histo\w*|bar chart|line chart|scatter|plot|chart|graph|visuali[sz]e|show me a|draw",
         query, re.I
     ):
         state["route"] = "visualization"
@@ -805,6 +1334,8 @@ def retrieval_node(state: AgentState) -> AgentState:
     docs = _elastic_search(state["session_id"], state["query"], top_k=10)
     if not docs:
         docs = _local_pdf_search(state["session_id"], state["query"], top_k=10)
+    if not docs:
+        docs = state.get("retrieved_docs", [])
     state["retrieved_docs"] = docs
     return state
 
@@ -822,30 +1353,53 @@ def visualization_node(state: AgentState) -> AgentState:
         state["citations"] = []
         return state
 
-    code = _generate_chart_code(query, df, state.get("data_summary", ""))
+    plan = _plan_chart(query, df, state.get("data_summary", ""), state.get("analysis_context"))
+    code = _generate_chart_code_from_plan(query, df, state.get("data_summary", ""), plan, state.get("analysis_context"))
     if not code:
-        state["answer"] = "I could not generate chart code for that request. Try rephrasing, for example: show me a histogram of RTX 3050 sales."
+        state["answer"] = "I could not generate chart code for that request. Try rephrasing, for example: show me a histogram of RTX 3050 sales or create a pie chart by channel."
         state["citations"] = []
         return state
 
     result = run_chart_code(code, df)
     if not result["ok"]:
+        repaired_code = _repair_chart_code(query, df, plan, code, result["error"])
+        if repaired_code:
+            code = repaired_code
+            result = run_chart_code(code, df)
+    if not result["ok"]:
+        fallback_code = _fallback_chart_code_from_plan(plan, df)
+        if fallback_code and fallback_code != code:
+            code = fallback_code
+            result = run_chart_code(code, df)
+    if not result["ok"]:
         state["answer"] = f"The chart ran into an issue: {result['error']}. Please try a simpler request."
         state["citations"] = []
         return state
 
-    title = _extract_chart_title(query)
+    title = plan.get("title") or _extract_chart_title(query)
     artifact = {
-        "type": _detect_chart_type(query),
+        "type": plan.get("chart_type") or _detect_chart_type(query),
         "title": title,
         "chart": result["chart"],
         "summary": result["summary"],
-        "metadata": {"query": query},
+        "metadata": {
+            "query": query,
+            "chart_type": plan.get("chart_type"),
+            "metric": plan.get("metric_col"),
+            "dimension": plan.get("dimension_col"),
+            "filter": f"{plan.get('filter_col')}={plan.get('filter_value')}" if plan.get("filter_col") and plan.get("filter_value") else "",
+            "planner": plan.get("reasoning", ""),
+        },
     }
     report_id = save_artifact(session_id, artifact)
-    state["scratchpad_link"] = f"/scratchpad/{session_id}/{report_id}"
-    state["answer"] = f"Here is your {title.lower()}."
+    state["scratchpad_link"] = f"/ui/scratchpad/{session_id}/{report_id}"
+    state["answer"] = _summarize_chart_result(query, plan, result["summary"])
     state["citations"] = []
+    state["followups"] = [
+        "Explain the chart pattern",
+        "Create a pie chart by channel",
+        "Show this as a monthly trend",
+    ]
     return state
 
 
@@ -997,7 +1551,7 @@ summary = (
         "metadata": {"metric": metric, "group_a": group_a, "group_b": group_b, "alpha": alpha},
     }
     report_id = save_artifact(session_id, artifact)
-    state["scratchpad_link"] = f"/scratchpad/{session_id}/{report_id}"
+    state["scratchpad_link"] = f"/ui/scratchpad/{session_id}/{report_id}"
     state["answer"] = result["summary"]
     state["citations"] = []
     return state
@@ -1135,6 +1689,9 @@ def synthesis_node(state: AgentState) -> AgentState:
 
 
 def followup_node(state: AgentState) -> AgentState:
+    if state.get("followups"):
+        return state
+
     # Prefer suggestions surfaced by individual stat agents (most contextual)
     if state.get("suggested_followups"):
         state["followups"] = state["suggested_followups"][:3]

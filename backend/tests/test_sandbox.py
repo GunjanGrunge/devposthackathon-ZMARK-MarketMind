@@ -1,3 +1,5 @@
+import json
+
 import pandas as pd
 from app.services.sandbox import run_chart_code
 
@@ -35,3 +37,22 @@ def test_non_plotly_fig_is_rejected():
     code = "fig = {'fake': 'dict'}\nsummary = ''"
     result = run_chart_code(code, df)
     assert result["ok"] is False
+
+
+def test_chart_json_is_serializable_without_plotly_encoder():
+    df = pd.DataFrame(
+        {
+            "month": pd.to_datetime(["2026-01-01", "2026-02-01"]),
+            "revenue": [100.0, 200.0],
+        }
+    )
+    code = """
+import plotly.express as px
+fig = px.line(df, x="month", y="revenue", markers=True)
+summary = "Revenue trend"
+"""
+
+    result = run_chart_code(code, df)
+
+    assert result["ok"] is True
+    json.dumps(result["chart"])

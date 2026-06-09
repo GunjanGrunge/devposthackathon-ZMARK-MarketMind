@@ -50,6 +50,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { ChatBubble } from "./ChatBubble";
 import { ClarificationForm } from "./ClarificationForm";
 import { ScratchpadPage } from "./ScratchpadPage";
+import Plot from "react-plotly.js";
 
 function SqlDatabaseIcon({ size = 16, className, style }) {
   return (
@@ -156,7 +157,8 @@ const ICONS = {
   snowflake: SnowflakeIcon,
 };
 
-const ACCEPTED_EXTENSIONS = [".csv", ".xlsx", ".xls", ".pdf"];
+const ACCEPTED_EXTENSIONS = [".csv", ".xlsx", ".xls", ".xlsm", ".xlsb", ".xltx", ".xltm", ".ods", ".xl", ".pdf"];
+const ACCEPTED_FILE_TYPES = ACCEPTED_EXTENSIONS.join(",");
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 const MAX_FILES = 10;
 
@@ -310,7 +312,7 @@ function compactMoney(value) {
 }
 
 function App() {
-  const [theme, setTheme] = React.useState("light");
+  const [theme, setTheme] = React.useState(() => localStorage.getItem("zmark.theme") || "dark");
   const [screen, setScreen] = React.useState("landing");
   const [powerMode, setPowerMode] = React.useState(false);
   const [powerTab, setPowerTab] = React.useState("obsolescence");
@@ -338,6 +340,7 @@ function App() {
     root.setAttribute("data-theme", theme);
     root.setAttribute("data-density", "compact");
     root.style.setProperty("--accent", "#4f46e5");
+    localStorage.setItem("zmark.theme", theme);
   }, [theme]);
 
   React.useEffect(() => {
@@ -451,25 +454,103 @@ function App() {
   async function handleSend(text) {
     const query = text.trim();
     if (!query || sending) return;
-    setMessages((current) => [...current, { role: "user", content: query }]);
+    const assistantId = crypto.randomUUID();
+    const fallbackText = "I couldn't find relevant data in your uploaded files for this question.";
+    setMessages((current) => [
+      ...current,
+      { role: "user", content: query },
+      { id: assistantId, role: "assistant", content: "", streaming: true, citations: [], followups: [] },
+    ]);
     setSending(true);
     try {
       const history = messages.slice(-6).map(({ role, content }) => ({ role, content }));
-      const response = await api.sendChat(query, history);
-      const message = response.message || {};
-      setMessages((current) => [...current, {
-        role: "assistant",
-        content: message.content || "I couldn't find relevant data in your uploaded files for this question.",
-        citations: message.citations || [],
-        followups: message.followups || [],
-      }]);
+      let streamed = false;
+      await api.streamChat(query, history, (event) => {
+        if (event.event === "status") {
+          setMessages((current) => current.map((message) => (
+            message.id === assistantId && !message.content
+              ? { ...message, content: event.message || "Thinking..." }
+              : message
+          )));
+          return;
+        }
+        if (event.event === "metadata") {
+          const meta = event.message || {};
+          setMessages((current) => current.map((message) => (
+            message.id === assistantId
+              ? {
+                ...message,
+                content: "",
+                citations: meta.citations || [],
+                followups: meta.followups || [],
+                scratchpad_link: meta.scratchpad_link || null,
+                clarification_form: meta.clarification_form || null,
+              }
+              : message
+          )));
+          return;
+        }
+        if (event.event === "chunk") {
+          streamed = true;
+          setMessages((current) => current.map((message) => (
+            message.id === assistantId
+              ? { ...message, content: `${message.content || ""}${event.content || ""}` }
+              : message
+          )));
+          return;
+        }
+        if (event.event === "done") {
+          const finalMessage = event.message || {};
+          setMessages((current) => current.map((message) => (
+            message.id === assistantId
+              ? {
+                ...message,
+                streaming: false,
+                content: finalMessage.content || (streamed ? message.content : fallbackText),
+                citations: finalMessage.citations || message.citations || [],
+                followups: finalMessage.followups || message.followups || [],
+                scratchpad_link: finalMessage.scratchpad_link || message.scratchpad_link || null,
+                clarification_form: finalMessage.clarification_form || message.clarification_form || null,
+              }
+              : message
+          )));
+          return;
+        }
+        if (event.event === "error") {
+          throw new Error(event.message || "Streaming chat failed");
+        }
+      });
     } catch (err) {
-      setMessages((current) => [...current, {
-        role: "assistant",
-        content: `Chat error: ${err.message}`,
-        citations: [],
-        followups: ["Retry after checking the backend"],
-      }]);
+      try {
+        const history = messages.slice(-6).map(({ role, content }) => ({ role, content }));
+        const response = await api.sendChat(query, history);
+        const message = response.message || {};
+        setMessages((current) => current.map((item) => (
+          item.id === assistantId
+            ? {
+              ...item,
+              streaming: false,
+              content: message.content || fallbackText,
+              citations: message.citations || [],
+              followups: message.followups || [],
+              scratchpad_link: message.scratchpad_link || null,
+              clarification_form: message.clarification_form || null,
+            }
+            : item
+        )));
+      } catch (fallbackErr) {
+        setMessages((current) => current.map((message) => (
+          message.id === assistantId
+            ? {
+              ...message,
+              streaming: false,
+              content: `Chat error: ${fallbackErr.message || err.message}`,
+              citations: [],
+              followups: ["Retry after checking the backend"],
+            }
+            : message
+        )));
+      }
     } finally {
       setSending(false);
     }
@@ -523,7 +604,7 @@ function App() {
         onNewSession={newSession}
       />
       <div className="z-work">
-        <input ref={addFilesInputRef} type="file" accept=".csv,.xlsx,.xls,.pdf" multiple hidden onChange={(event) => handleFilesSelected(event.target.files)} />
+        <input ref={addFilesInputRef} type="file" accept={ACCEPTED_FILE_TYPES} multiple hidden onChange={(event) => handleFilesSelected(event.target.files)} />
         <input ref={policyInputRef} type="file" accept=".pdf" multiple hidden onChange={(event) => handleFilesSelected(event.target.files)} />
         <FilesRail
           files={sessionFiles}
@@ -587,7 +668,7 @@ function Landing({ theme, onTheme, onUpload }) {
           <div className="z-landing-eyebrow"><Icon name="sparkles" size={13} /> Business intelligence agent</div>
           <h1 className="z-landing-h1">Turn raw data into <span className="z-accent-text">decisions</span>.</h1>
           <p className="z-landing-sub">Upload your sales spreadsheets and compliance documents. ZmaRk analyzes, charts, and answers with LangGraph agents grounded in your session data.</p>
-          <input ref={inputRef} type="file" accept=".csv,.xlsx,.xls,.pdf" multiple hidden onChange={(event) => handleFiles(event.target.files)} />
+          <input ref={inputRef} type="file" accept={ACCEPTED_FILE_TYPES} multiple hidden onChange={(event) => handleFiles(event.target.files)} />
           <input ref={policyInputRef} type="file" accept=".pdf" multiple hidden onChange={(event) => handleFiles(event.target.files)} />
           <div
             className={`z-dropzone ${drag ? "is-drag" : ""}`}
@@ -721,7 +802,7 @@ function UploadProgress({ files, onDone, onError }) {
         <div className="z-flow-files">
           {files.map((file) => {
             const ext = file.name.split(".").pop()?.toLowerCase();
-            const type = ext === "pdf" ? "pdf" : ext === "xlsx" || ext === "xls" ? "xlsx" : "csv";
+            const type = ext === "pdf" ? "pdf" : ext === "csv" ? "csv" : "xlsx";
             const size = file.size > 1048576 ? `${(file.size / 1048576).toFixed(1)} MB` : `${Math.round(file.size / 1024)} KB`;
             return (
               <div key={file.name} className="z-flow-file">
@@ -840,10 +921,54 @@ function FilesRail({ files, onAdd, onAddPolicy }) {
   );
 }
 
+function formatValueList(values, limit = 3) {
+  const cleaned = [...new Set(values.filter(Boolean).map((value) => String(value).trim()).filter(Boolean))].slice(0, limit);
+  if (!cleaned.length) return "";
+  if (cleaned.length === 1) return cleaned[0];
+  if (cleaned.length === 2) return `${cleaned[0]} and ${cleaned[1]}`;
+  return `${cleaned.slice(0, -1).join(", ")}, and ${cleaned[cleaned.length - 1]}`;
+}
+
+function dashboardBusinessFocus(dashData) {
+  if (!dashData) return "";
+  const products = (dashData.products || []).map((product) => product.name);
+  const productCategories = (dashData.products || []).map((product) => product.category);
+  const categories = (dashData.categories || []).map((category) => category.label);
+  const channels = (dashData.channels || []).map((channel) => channel.label);
+
+  const categoryText = formatValueList([...productCategories, ...categories], 3);
+  const productText = formatValueList(products, 4);
+  const channelText = formatValueList(channels, 2);
+
+  let sentence = "";
+  if (categoryText && productText) {
+    sentence = `This dataset appears to focus on sales of ${categoryText}, including ${productText}.`;
+  } else if (productText) {
+    sentence = `This dataset appears to focus on sales of products such as ${productText}.`;
+  } else if (categoryText) {
+    sentence = `This dataset appears to focus on sales across ${categoryText}.`;
+  }
+
+  if (sentence && channelText) {
+    sentence = `${sentence.slice(0, -1)} through ${channelText} channels.`;
+  }
+  return sentence;
+}
+
+function dashboardSummaryText(dashData) {
+  const summary = (dashData?.summary || "").trim();
+  if (!summary) return "Upload files and run analysis to generate a summary.";
+  if (summary.toLowerCase().startsWith("this dataset appears to focus")) return summary;
+  const focus = dashboardBusinessFocus(dashData);
+  return focus ? `${focus} ${summary}` : summary;
+}
+
 function DashboardMain({ dashData, dashLoading, powerMode, powerTab, setPowerTab }) {
   const trend = dashData?.revenue_trend;
   const products = dashData?.products || [];
   const trendData = (trend?.labels || []).map((label, index) => ({ label, revenue: trend.values[index], anomaly: trend.anomaly_index === index }));
+  const revenueTrendChart = dashData?.charts?.revenue_trend?.chart;
+  const agentCharts = dashData?.agent_charts || [];
   const topProducts = [...products].sort((a, b) => b.revenue - a.revenue).slice(0, 8);
   const velocity = products.filter((product) => product.velocity != null).sort((a, b) => b.velocity - a.velocity).slice(0, 8);
   const channels = dashData?.channels || [];
@@ -862,19 +987,29 @@ function DashboardMain({ dashData, dashLoading, powerMode, powerTab, setPowerTab
       </div>
 
       <Card className="z-summary" icon="sparkles" title="Business summary" subtitle="Plain-English narrative generated from your uploaded data" actions={<Badge tone="accent" icon="cpu">Backend EDA</Badge>}>
-        <p className="z-summary-text">{dashData?.summary || "Upload files and run analysis to generate a summary."}</p>
+        <p className="z-summary-text">{dashboardSummaryText(dashData)}</p>
       </Card>
 
-      <Card title="Revenue trend" subtitle={`Monthly revenue - ${trendData.length} data points`} icon="trendUp" actions={anomalyIdx != null ? <Badge tone="danger" dot>1 anomaly</Badge> : null}>
-        <ChartShell>{trendData.length ? <TrendChart data={trendData} /> : <EmptyChart />}</ChartShell>
+      <Card title="Revenue trend" subtitle={`Monthly revenue - ${trendData.length || revenueTrendChart?.data?.[0]?.x?.length || 0} data points`} icon="trendUp" actions={anomalyIdx != null ? <Badge tone="danger" dot>1 anomaly</Badge> : null}>
+        <ChartShell>{revenueTrendChart ? <DashboardPlotlyChart chart={revenueTrendChart} /> : trendData.length ? <TrendChart data={trendData} /> : <EmptyChart />}</ChartShell>
       </Card>
 
-      <div className="z-chart-grid">
-        <Card title="Top products" subtitle="By revenue" icon="barChart"><ChartShell>{topProducts.length ? <BarSeries data={topProducts.map((p) => ({ name: p.name, value: p.revenue }))} /> : <EmptyChart />}</ChartShell></Card>
-        <Card title="Sales velocity" subtitle="Units / period" icon="activity"><ChartShell>{velocity.length ? <BarSeries data={velocity.map((p) => ({ name: p.name, value: p.velocity }))} /> : <EmptyChart />}</ChartShell></Card>
-        <Card title="Channel performance" subtitle="Revenue by channel" icon="layers"><ChartShell>{channels.length ? <BarSeries data={channels.map((c) => ({ name: c.label, value: c.value }))} /> : <EmptyChart />}</ChartShell></Card>
-        <Card title="Category mix" subtitle="Revenue by category" icon="database"><ChartShell>{categories.length ? <BarSeries data={categories.map((c) => ({ name: c.label, value: c.value }))} /> : <EmptyChart />}</ChartShell></Card>
-      </div>
+      {agentCharts.length ? (
+        <div className="z-chart-grid">
+          {agentCharts.map((card, index) => (
+            <Card key={`${card.title || "chart"}-${index}`} title={card.title || "Analysis chart"} subtitle={card.subtitle || card.summary || "Generated from uploaded data"} icon={card.type === "pie" ? "database" : card.type === "line" ? "trendUp" : "barChart"}>
+              <ChartShell>{card.chart ? <DashboardPlotlyChart chart={card.chart} /> : <EmptyChart />}</ChartShell>
+            </Card>
+          ))}
+        </div>
+      ) : (
+        <div className="z-chart-grid">
+          <Card title="Top products" subtitle="By revenue" icon="barChart"><ChartShell>{topProducts.length ? <BarSeries data={topProducts.map((p) => ({ name: p.name, value: p.revenue }))} /> : <EmptyChart />}</ChartShell></Card>
+          <Card title="Sales velocity" subtitle="Units / period" icon="activity"><ChartShell>{velocity.length ? <BarSeries data={velocity.map((p) => ({ name: p.name, value: p.velocity }))} /> : <EmptyChart />}</ChartShell></Card>
+          <Card title="Channel performance" subtitle="Revenue by channel" icon="layers"><ChartShell>{channels.length ? <BarSeries data={channels.map((c) => ({ name: c.label, value: c.value }))} /> : <EmptyChart />}</ChartShell></Card>
+          <Card title="Category mix" subtitle="Revenue by category" icon="database"><ChartShell>{categories.length ? <BarSeries data={categories.map((c) => ({ name: c.label, value: c.value }))} /> : <EmptyChart />}</ChartShell></Card>
+        </div>
+      )}
 
       {powerMode && (
         <div className="z-power-wrap">
@@ -897,33 +1032,121 @@ function ChartShell({ children }) {
   return <div style={{ width: "100%", height: 230 }}>{children}</div>;
 }
 
+function cssVar(name, fallback) {
+  if (typeof window === "undefined") return fallback;
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
+function chartThemeColors() {
+  return {
+    text: cssVar("--text", "#14181f"),
+    text2: cssVar("--text-2", "#3f4856"),
+    text3: cssVar("--text-3", "#687386"),
+    border: cssVar("--border", "#e3e6eb"),
+    surface: cssVar("--surface", "#ffffff"),
+    accent: cssVar("--accent", "#4f46e5"),
+  };
+}
+
 function EmptyChart() {
   return <div className="z-empty">No chart data returned for this session.</div>;
 }
 
 function TrendChart({ data }) {
+  const colors = chartThemeColors();
   return (
     <ResponsiveContainer width="100%" height="100%">
       <LineChart data={data}>
-        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-        <XAxis dataKey="label" tick={{ fontSize: 11, fill: "var(--text-3)" }} />
-        <YAxis tick={{ fontSize: 11, fill: "var(--text-3)" }} />
+        <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
+        <XAxis dataKey="label" tick={{ fontSize: 11, fill: colors.text3 }} />
+        <YAxis tick={{ fontSize: 11, fill: colors.text3 }} />
         <Tooltip />
-        <Line type="monotone" dataKey="revenue" stroke="var(--accent)" strokeWidth={2} dot={(props) => <Cell {...props} fill={props.payload?.anomaly ? "var(--danger)" : "var(--accent)"} />} />
+        <Line type="monotone" dataKey="revenue" stroke={colors.accent} strokeWidth={2} dot={(props) => <Cell {...props} fill={props.payload?.anomaly ? cssVar("--danger", "#c62b3f") : colors.accent} />} />
       </LineChart>
     </ResponsiveContainer>
   );
 }
 
+function themedPlotlyLayout(layout, colors) {
+  const axisStyle = (axis = {}) => ({
+    ...axis,
+    color: colors.text2,
+    gridcolor: axis.gridcolor || colors.border,
+    zerolinecolor: axis.zerolinecolor || colors.border,
+    tickfont: { ...(axis.tickfont || {}), color: colors.text3 },
+    title: typeof axis.title === "string"
+      ? { text: axis.title, font: { color: colors.text2 } }
+      : { ...(axis.title || {}), font: { ...(axis.title?.font || {}), color: colors.text2 } },
+  });
+  const title = typeof layout.title === "string"
+    ? { text: layout.title, font: { color: colors.text } }
+    : { ...(layout.title || {}), font: { ...(layout.title?.font || {}), color: colors.text } };
+
+  return {
+    ...layout,
+    template: null,
+    paper_bgcolor: "transparent",
+    plot_bgcolor: "transparent",
+    font: { ...(layout.font || {}), color: colors.text2, size: layout.font?.size || 11, family: layout.font?.family || "IBM Plex Sans, sans-serif" },
+    title,
+    xaxis: axisStyle(layout.xaxis),
+    yaxis: axisStyle(layout.yaxis),
+    legend: { ...(layout.legend || {}), font: { ...(layout.legend?.font || {}), color: colors.text2 } },
+    hoverlabel: {
+      ...(layout.hoverlabel || {}),
+      bgcolor: colors.surface,
+      bordercolor: colors.border,
+      font: { ...(layout.hoverlabel?.font || {}), color: colors.text },
+    },
+    annotations: (layout.annotations || []).map((annotation) => ({
+      ...annotation,
+      font: { ...(annotation.font || {}), color: colors.text2 },
+    })),
+  };
+}
+
+function themedPlotlyData(data, colors) {
+  return (data || []).map((trace) => ({
+    ...trace,
+    textfont: { ...(trace.textfont || {}), color: trace.textfont?.color || colors.text2 },
+    insidetextfont: { ...(trace.insidetextfont || {}), color: trace.insidetextfont?.color || "#ffffff" },
+    outsidetextfont: { ...(trace.outsidetextfont || {}), color: trace.outsidetextfont?.color || colors.text2 },
+    hoverlabel: {
+      ...(trace.hoverlabel || {}),
+      font: { ...(trace.hoverlabel?.font || {}), color: colors.text },
+    },
+  }));
+}
+
+function DashboardPlotlyChart({ chart }) {
+  const colors = chartThemeColors();
+  const layout = themedPlotlyLayout(chart.layout || {}, colors);
+  return (
+    <Plot
+      data={themedPlotlyData(chart.data, colors)}
+      layout={{
+        ...layout,
+        autosize: true,
+        margin: { l: 36, r: 12, t: 32, b: 36, ...(layout.margin || {}) },
+      }}
+      config={{ displayModeBar: false, responsive: true }}
+      style={{ width: "100%", height: "100%" }}
+      useResizeHandler
+    />
+  );
+}
+
 function BarSeries({ data }) {
+  const colors = chartThemeColors();
   return (
     <ResponsiveContainer width="100%" height="100%">
       <BarChart data={data}>
-        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+        <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
         <XAxis dataKey="name" hide />
-        <YAxis tick={{ fontSize: 11, fill: "var(--text-3)" }} />
+        <YAxis tick={{ fontSize: 11, fill: colors.text3 }} />
         <Tooltip formatter={(value) => money(value)} />
-        <Bar dataKey="value" fill="var(--accent)" radius={[4, 4, 0, 0]} />
+        <Bar dataKey="value" fill={colors.accent} radius={[4, 4, 0, 0]} />
       </BarChart>
     </ResponsiveContainer>
   );
@@ -1008,9 +1231,36 @@ function MonteCarlo({ products }) {
   const [product, setProduct] = React.useState(products[0]?.name || "");
   const [budget, setBudget] = React.useState(30);
   const [horizon, setHorizon] = React.useState("90");
+  const [simulations, setSimulations] = React.useState("5000");
+  const [result, setResult] = React.useState(null);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState("");
   React.useEffect(() => {
     if (!product && products[0]?.name) setProduct(products[0].name);
   }, [product, products]);
+  const runSimulation = async () => {
+    if (!product || loading) return;
+    setLoading(true);
+    setError("");
+    try {
+      const response = await api.runMonteCarlo({
+        product,
+        budgetChangePct: budget,
+        horizonDays: Number(horizon),
+        simulations: Number(simulations),
+      });
+      setResult(response);
+    } catch (err) {
+      setError(err.message);
+      setResult(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+  const distributionData = (result?.distribution || []).map((point) => ({
+    name: `P${point.percentile}`,
+    value: point.revenue,
+  }));
   return (
     <div className="z-mc">
       <div className="z-mc-controls">
@@ -1026,13 +1276,44 @@ function MonteCarlo({ products }) {
           <span className="z-ctrl-lbl">Time horizon</span>
           <Select value={horizon} onChange={setHorizon} options={[{ value: "30", label: "30 days" }, { value: "60", label: "60 days" }, { value: "90", label: "90 days" }, { value: "180", label: "180 days" }]} />
         </label>
-        <Button variant="primary" icon="target" disabled>Backend endpoint next</Button>
+        <label className="z-ctrl">
+          <span className="z-ctrl-lbl">Runs</span>
+          <Select value={simulations} onChange={setSimulations} options={[{ value: "1000", label: "1k" }, { value: "5000", label: "5k" }, { value: "10000", label: "10k" }]} />
+        </label>
+        <Button variant="primary" icon="target" disabled={!product || loading} onClick={runSimulation}>{loading ? "Running..." : "Run simulation"}</Button>
       </div>
-      <div className="z-mc-placeholder">
-        <Icon name="target" size={22} />
-        <p>Monte Carlo controls match the original design. Simulation API integration is the next backend feature.</p>
-        <span className="z-muted-xs">No generated distribution is shown until the simulation endpoint is wired.</span>
-      </div>
+      {error && <div className="z-mc-error">{error}</div>}
+      {!result && !error && (
+        <div className="z-mc-placeholder">
+          <Icon name="target" size={22} />
+          <p>Run the Monte Carlo agent against the products detected from your uploaded data.</p>
+          <span className="z-muted-xs">Simulation uses session rows, inferred revenue/date/product columns, and observed volatility.</span>
+        </div>
+      )}
+      {result && (
+        <div className="z-mc-result">
+          <div className="z-mc-stats">
+            <Stat label="Expected revenue" value={money(result.expected_revenue)} sub={`${result.simulations.toLocaleString()} runs`} />
+            <Stat label="Median" value={money(result.p50_revenue)} sub={`${result.horizon_days} day horizon`} />
+            <Stat label="P10 / P90 range" value={`${compactMoney(result.p10_revenue)} - ${compactMoney(result.p90_revenue)}`} sub="80% simulation band" />
+            <Stat label="Beat baseline" value={`${result.probability_above_baseline.toFixed(1)}%`} sub={`baseline ${compactMoney(result.baseline_revenue)}`} />
+          </div>
+          <div className="z-mc-chart">
+            <div className="z-mini-axislabel">Revenue percentile distribution for {result.product}</div>
+            <ChartShell><BarSeries data={distributionData} /></ChartShell>
+          </div>
+          <div className="z-interp">
+            <span className="z-interp-ic"><Icon name="sparkles" size={14} /></span>
+            <div>
+              <div className="z-interp-lbl">Monte Carlo agent interpretation</div>
+              <p>{result.summary}</p>
+              <ul className="z-mc-assumptions">
+                {result.assumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1074,10 +1355,7 @@ function ChatPanel({ messages, sending, onSend, suggested }) {
             <ChatBubble
               message={message}
               sessionId={api.getSessionId()}
-              onFollowup={(text) => {
-                /* set input and send */
-                setDraft(text);
-              }}
+              onFollowup={(text) => submit(text)}
             />
             {message.clarification_form && (
               <ClarificationForm
@@ -1161,7 +1439,7 @@ function TypingDots() {
 }
 
 createRoot(document.getElementById("root")).render(
-  <BrowserRouter>
+  <BrowserRouter basename="/ui">
     <Routes>
       <Route path="/scratchpad/:sessionId/:reportId" element={<ScratchpadPage />} />
       <Route path="*" element={<App />} />

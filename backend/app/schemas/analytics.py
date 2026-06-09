@@ -67,6 +67,8 @@ class DashboardResponse(BaseModel):
     channels: List[ChartPoint]
     categories: List[ChartPoint]
     suggested_questions: List[str]
+    charts: Optional[Dict[str, Any]] = None
+    agent_charts: Optional[List[Dict[str, Any]]] = None
 
 
 # ── Power Mode: Obsolescence ──
@@ -109,6 +111,36 @@ class BudgetResponse(BaseModel):
     increase: List[BudgetItem]
     maintain: List[BudgetItem]
     reduce: List[BudgetItem]
+
+
+# ── Power Mode: Monte Carlo ──
+class MonteCarloRequest(BaseModel):
+    product: str
+    budget_change_pct: float = 0
+    horizon_days: int = 90
+    simulations: int = 5000
+
+
+class MonteCarloPoint(BaseModel):
+    percentile: int
+    revenue: float
+
+
+class MonteCarloResponse(BaseModel):
+    product: str
+    horizon_days: int
+    simulations: int
+    budget_change_pct: float
+    baseline_revenue: float
+    expected_revenue: float
+    p10_revenue: float
+    p50_revenue: float
+    p90_revenue: float
+    probability_above_baseline: float
+    probability_loss: float
+    distribution: List[MonteCarloPoint]
+    summary: str
+    assumptions: List[str]
 
 
 # ── Chat ──

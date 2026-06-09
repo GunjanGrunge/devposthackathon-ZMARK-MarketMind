@@ -1,0 +1,55 @@
+# Dependency directories
+node_modules/
+frontend/node_modules/
+backend/venv/
+venv/
+.venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Python cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.scratchpad_cache/
+.session_cache/
+backend/.scratchpad_cache/
+backend/.session_cache/
+backend/app/__pycache__/
+backend/app/api/v1/routes/__pycache__/
+backend/app/schemas/__pycache__/
+backend/app/services/__pycache__/
+backend/tests/__pycache__/
+
+# Agent/builder caches
+.agent/
+.agents/
+.claude/
+_bmad/
+_bmad-output/
+skills-lock.json
+
+# Build and IDE files
+dist/
+frontend/dist/
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Media/uploads
+uploads/
+backend/uploads/
+*.log
+
+# Scratch / reference files
+contextforpdf.md.txt
+screens.jsx
