@@ -1,0 +1,15 @@
+.git
+.github
+node_modules/
+frontend/node_modules/
+backend/venv/
+venv/
+.venv/
+__pycache__/
+*.pyc
+frontend/dist/
+backend/.scratchpad_cache/
+backend/.session_cache/
+.pytest_cache/
+uploads/
+backend/uploads/
