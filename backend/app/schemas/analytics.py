@@ -58,6 +58,14 @@ class ProductRow(BaseModel):
     rationale: Optional[str] = None  # plain-English explanation of the risk score
 
 
+# ── Policy / business-rule exclusions ──
+class PolicyExclusion(BaseModel):
+    type: str               # "month" | "category" | "channel"
+    description: str        # human-readable, e.g. "May profit excluded per policy"
+    excluded_amount: float  # revenue/profit amount excluded
+    source_filename: str    # PDF that defined the rule
+
+
 # ── Full dashboard response ──
 class DashboardResponse(BaseModel):
     kpi: KPIData
@@ -69,6 +77,7 @@ class DashboardResponse(BaseModel):
     suggested_questions: List[str]
     charts: Optional[Dict[str, Any]] = None
     agent_charts: Optional[List[Dict[str, Any]]] = None
+    policy_exclusions: List[PolicyExclusion] = []
 
 
 # ── Power Mode: Obsolescence ──

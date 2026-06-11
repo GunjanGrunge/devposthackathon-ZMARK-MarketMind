@@ -17,7 +17,9 @@ from app.schemas.analytics import (
     KPIData, ChartPoint, RevenueTrendResponse, ProductRow, DashboardResponse,
     ObsolescenceRow, ObsolescenceResponse, RiskBreakdown, TrendPoint,
     BudgetItem, BudgetResponse, MonteCarloPoint, MonteCarloResponse,
+    PolicyExclusion,
 )
+from app.services.business_rules_service import get_session_business_rules
 
 logger = logging.getLogger("analytics")
 
@@ -605,6 +607,7 @@ def _generate_business_summary(
     category_col: Optional[str] = None,
     channel_col: Optional[str] = None,
     units_col: Optional[str] = None,
+    policy_exclusions: Optional[List["PolicyExclusion"]] = None,
 ) -> str:
     parts: List[str] = []
     focus_sentence = _business_focus_sentence(df, product_col, category_col, channel_col)
@@ -674,7 +677,14 @@ def _generate_business_summary(
             "investigate it before reallocating budget."
         )
 
-    return " ".join(parts[:7])
+    if policy_exclusions:
+        for excl in policy_exclusions:
+            parts.append(
+                f"Note: As per policy ({excl.source_filename}), "
+                f"{excl.description} (${excl.excluded_amount:,.0f}) is excluded from the above figures."
+            )
+
+    return " ".join(parts[:8])
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1228,6 +1238,27 @@ def compute_dashboard(session_id: str) -> DashboardResponse:
         )
 
     combined[revenue_col] = _numeric_series(combined[revenue_col]).fillna(0)
+
+    # ── Apply business rules / policy exclusions ───────────────────────────
+    policy_exclusions: List[PolicyExclusion] = []
+    rules = get_session_business_rules(session_id)
+    if rules and date_col:
+        combined["_date"] = _datetime_series(combined[date_col])
+        import calendar as _cal
+        for month_num in rules.get("exclude_months", []):
+            mask = combined["_date"].dt.month == month_num
+            excluded_amount = float(combined.loc[mask, revenue_col].sum())
+            month_name = _cal.month_name[month_num]
+            policy_exclusions.append(PolicyExclusion(
+                type="month",
+                description=f"{month_name} month profit/revenue",
+                excluded_amount=round(excluded_amount, 2),
+                source_filename=rules.get("source_filename", "policy.pdf"),
+            ))
+            combined = combined[~mask].copy()
+        if "_date" in combined.columns:
+            combined = combined.drop(columns=["_date"])
+
     total_revenue = float(combined[revenue_col].sum())
 
     # ── Revenue trend ──────────────────────────────────────────────────────
@@ -1338,6 +1369,7 @@ def compute_dashboard(session_id: str) -> DashboardResponse:
         combined, revenue_col, product_col, total_revenue, revenue_delta,
         anomaly_idx, labels, date_col=date_col, category_col=category_col,
         channel_col=channel_col, units_col=units_col,
+        policy_exclusions=policy_exclusions if policy_exclusions else None,
     )
 
     dashboard = DashboardResponse(
@@ -1353,6 +1385,7 @@ def compute_dashboard(session_id: str) -> DashboardResponse:
             "Are there any at-risk products?",
             "What does my channel mix look like?",
         ],
+        policy_exclusions=policy_exclusions,
     )
     return _attach_dashboard_charts(session_id, combined.copy(), dashboard)
 

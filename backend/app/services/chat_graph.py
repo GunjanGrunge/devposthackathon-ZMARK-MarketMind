@@ -28,6 +28,7 @@ from app.services.analytics import (
     _find_revenue_col,
     _find_units_col,
 )
+from app.services.business_rules_service import get_session_business_rules
 
 logger = logging.getLogger("chat_graph")
 
@@ -47,8 +48,9 @@ class AgentState(TypedDict, total=False):
     followups: List[str]
     suggested_followups: List[str]
     error: Optional[str]
-    scratchpad_link: Optional[str]          # new
-    clarification_form: Optional[Dict[str, Any]]   # new
+    scratchpad_link: Optional[str]
+    clarification_form: Optional[Dict[str, Any]]
+    policy_context: str             # human-readable summary of active business-rule exclusions
 
 
 def _find_col(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
@@ -1257,6 +1259,46 @@ def _extract_chart_title(query: str) -> str:
     return q[:60].title()
 
 
+def _apply_business_rules_to_frames(
+    frames: List[Dict[str, Any]],
+    rules: Optional[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], str]:
+    """
+    Returns (filtered_frames, policy_context_text).
+    Filters rows from each frame's DataFrame according to active month-exclusion rules.
+    """
+    if not rules or not rules.get("exclude_months"):
+        return frames, ""
+
+    import calendar as _cal
+    from app.services.analytics import _datetime_series, _find_date_col
+
+    excluded_months: List[int] = rules["exclude_months"]
+    source: str = rules.get("source_filename", "policy.pdf")
+    month_names = [_cal.month_name[m] for m in excluded_months]
+
+    filtered: List[Dict[str, Any]] = []
+    for frame in frames:
+        df: pd.DataFrame = frame["df"].copy()
+        date_col = _find_date_col(df)
+        if date_col:
+            dates = _datetime_series(df[date_col])
+            mask = dates.dt.month.isin(excluded_months)
+            df = df[~mask].reset_index(drop=True)
+        filtered.append({**frame, "df": df})
+
+    names_str = ", ".join(month_names)
+    policy_context = (
+        f"ACTIVE BUSINESS RULES (from {source}):\n"
+        f"The following months are excluded from all profit/revenue calculations "
+        f"as per company policy: {names_str}.\n"
+        f"When answering any question about totals, profit, revenue, or calculations, "
+        f"DO NOT include data from {names_str}. "
+        f"Always mention this exclusion in your answer."
+    )
+    return filtered, policy_context
+
+
 def load_data_node(state: AgentState) -> AgentState:
     try:
         from app.services.analysis_context import get_analysis_context
@@ -1269,8 +1311,13 @@ def load_data_node(state: AgentState) -> AgentState:
     except Exception as exc:
         logger.warning("Analysis context load failed: %s", exc)
         frames = _load_session_dataframes(state["session_id"])
+
+    rules = get_session_business_rules(state["session_id"])
+    frames, policy_context = _apply_business_rules_to_frames(frames, rules)
+
     state["dataframes"] = frames
     state["data_summary"] = _build_data_summary(frames)
+    state["policy_context"] = policy_context
     return state
 
 
@@ -1616,6 +1663,7 @@ def synthesis_node(state: AgentState) -> AgentState:
     stats_results = state.get("stats_results", [])
     retrieved_docs = state.get("retrieved_docs", [])
     data_summary = state.get("data_summary", "")
+    policy_context = state.get("policy_context", "")
 
     # ── No data at all ──────────────────────────────────────────────────────
     if not stats_results and not retrieved_docs:
@@ -1625,13 +1673,13 @@ def synthesis_node(state: AgentState) -> AgentState:
                 "questions about revenue, products, channels, and more."
             )
         elif settings.gemini_api_key and data_summary:
-            # Data is loaded but no specific agent matched — let Gemini answer from the data summary
             answer = _gemini_conversational(
                 query=state["query"],
                 local_facts="",
                 retrieved_docs=[],
                 history=state.get("history", []),
                 data_summary=data_summary,
+                policy_context=policy_context,
             )
             state["answer"] = answer or "I couldn't find relevant data in your uploaded files for this question."
         else:
@@ -1650,18 +1698,30 @@ def synthesis_node(state: AgentState) -> AgentState:
             retrieved_docs=retrieved_docs,
             history=state.get("history", []),
             data_summary=data_summary,
+            policy_context=policy_context,
         )
         if gemini_answer:
             state["answer"] = gemini_answer
         else:
-            # Gemini failed — fall back to local plain answer
-            state["answer"] = (
-                f"Based on your uploaded data, {local_facts}".strip()
-                if local_facts
-                else _retrieval_fallback_answer(retrieved_docs)
-            )
+            answer = f"Based on your uploaded data, {local_facts}".strip() if local_facts else _retrieval_fallback_answer(retrieved_docs)
+            if policy_context:
+                import calendar as _cal
+                from app.services.business_rules_service import get_session_business_rules
+                rules = get_session_business_rules(state["session_id"])
+                if rules and rules.get("exclude_months"):
+                    names = ", ".join(_cal.month_name[m] for m in rules["exclude_months"])
+                    answer += f" (Note: {names} data excluded per policy — {rules.get('source_filename', 'policy.pdf')})"
+            state["answer"] = answer
     elif local_facts:
-        state["answer"] = f"Based on your uploaded data, {local_facts}".strip()
+        answer = f"Based on your uploaded data, {local_facts}".strip()
+        if policy_context:
+            import calendar as _cal
+            from app.services.business_rules_service import get_session_business_rules
+            rules = get_session_business_rules(state["session_id"])
+            if rules and rules.get("exclude_months"):
+                names = ", ".join(_cal.month_name[m] for m in rules["exclude_months"])
+                answer += f" (Note: {names} data excluded per policy — {rules.get('source_filename', 'policy.pdf')})"
+        state["answer"] = answer
     elif retrieved_docs:
         state["answer"] = _retrieval_fallback_answer(retrieved_docs)
     else:
@@ -1769,11 +1829,13 @@ def _gemini_conversational(
     retrieved_docs: List[Dict[str, Any]],
     history: List[Dict[str, str]],
     data_summary: str = "",
+    policy_context: str = "",
 ) -> str:
     """
     Gemini-powered synthesis that is always conversational.
     local_facts = pre-computed stat agent findings (ground truth)
     data_summary = full data snapshot built from DataFrames
+    policy_context = active business-rule exclusions (injected before user question)
     """
     try:
         import google.generativeai as genai
@@ -1794,6 +1856,8 @@ def _gemini_conversational(
         )
 
         context_blocks: List[str] = []
+        if policy_context:
+            context_blocks.append(policy_context)
         if local_facts:
             context_blocks.append(f"COMPUTED FINDINGS (verified from user data — treat as facts):\n{local_facts}")
         if data_summary:

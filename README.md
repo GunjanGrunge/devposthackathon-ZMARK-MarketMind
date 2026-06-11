@@ -8,6 +8,7 @@ ZmaRk MarketMind is a next-generation Business Intelligence (BI) and conversatio
 
 *   **Ingestion & Auto-indexing**: Upload files to automatically generate metadata summaries, run exploratory data analysis (EDA), and index data into **Elasticsearch** for semantic/keyword retrieval.
 *   **Conversational BI Agent**: Powered by **FastAPI** and **LangGraph** (running Gemini models), the agent automatically routes queries to statistical analysis, policy document retrieval, data visualization, or hypothesis testing branches.
+*   **Business Rules Engine**: Upload a PDF containing company policy rules (e.g. *"exclude May month profit from calculations"*) alongside your data. The system automatically parses the rules, applies them to all profit/revenue KPIs on the dashboard, and instructs the chatbot to honour the same exclusions — surfacing a clear policy notice in both the summary and chat answers.
 *   **ZScratchpad (Rich Output Canvas)**: A dedicated display canvas (`/scratchpad/:sessionId/:reportId`) for complex agent outputs like interactive Plotly charts and structured reports, keeping the main chat thread clean.
 *   **Safe Execution Sandbox**: Safely compiles and executes LLM-generated Plotly Python code in a restricted namespace (`pandas`, `numpy`, `plotly`, `scipy`, `math`, `statistics` only).
 *   **Interactive Hypothesis Testing**: Walks users through custom hypothesis tests (T-Test, ANOVA, Chi-Square) via a dynamic frontend Clarification Form built with chips/selectors.
@@ -27,11 +28,16 @@ ZmaRk MarketMind is a next-generation Business Intelligence (BI) and conversatio
 
 ```mermaid
 graph TD
-    User([User Interface]) -->|1. Upload File| API[FastAPI Ingestion Route]
+    User([User Interface]) -->|1. Upload File CSV/Excel| API[FastAPI Ingestion Route]
+    User -->|1b. Upload Policy PDF| Rules[Business Rules Engine]
+    Rules -->|Parsed exclusions| Cache[(Rules Cache)]
     API -->|Index| ES[(Elasticsearch)]
     API -->|EDA Summary| Pandas[Pandas Analysis Engine]
+    Cache -->|Filter DataFrames| Pandas
     User -->|2. Natural Language Chat| Graph[LangGraph Agentic Flow]
-    Graph -->|Classify Route| Branch{Router}
+    Graph -->|Load & filter data| LoadNode[load_data_node]
+    Cache -->|Apply rules| LoadNode
+    LoadNode -->|Classify Route| Branch{Router}
     Branch -->|Text Q&A / Search| StatsNode[Statistics & Retrieval Nodes]
     Branch -->|Chart Request| VizNode[Visualization Node]
     Branch -->|Hypothesis Test| HypNode[Hypothesis Testing Nodes]
@@ -39,6 +45,8 @@ graph TD
     HypNode -->|Safe SciPy Stats| Sandbox
     Sandbox -->|Plotly JSON + Summary| Store[(In-Memory Scratchpad Store)]
     Store -->|Link: /scratchpad/:id| ScratchpadPage[Interactive Plotly Canvas]
+    StatsNode -->|policy_context| Gemini[Gemini Synthesis]
+    Gemini -->|Answer with policy notice| User
 ```
 
 ---
@@ -145,6 +153,31 @@ Configures Gemini prompt restrictions:
 *   Bans em-dashes (`—`).
 *   Requires citations to use standard `[n]` formats pointing to sources.
 *   Limits outputs to a maximum of 4 sentences.
+
+#### Task 5b: Business Rules Engine
+Adds PDF-driven policy enforcement across the entire analytics stack.
+
+**New file:** `backend/app/services/business_rules_service.py`
+*   `_is_policy_document(text)` — detects whether a PDF contains policy/rule language (`business rules`, `exclude`, `policy`, `shall not`, etc.)
+*   `extract_business_rules(text, filename)` — regex-parses month exclusions from natural language (e.g. *"exclude May month profit"*, *"January is excluded from total"*) into `{"exclude_months": [5], "source_filename": "...", "raw_notes": [...]}`
+*   `get_session_business_rules(session_id)` — scans all PDFs in the session, merges rules from any policy documents found, caches results by file fingerprint
+
+**Modified:** `backend/app/schemas/analytics.py`
+*   Added `PolicyExclusion` model (`type`, `description`, `excluded_amount`, `source_filename`)
+*   Added `policy_exclusions: List[PolicyExclusion]` field to `DashboardResponse`
+
+**Modified:** `backend/app/services/analytics.py`
+*   `compute_dashboard` loads session business rules, filters excluded-month rows from the combined DataFrame before computing any KPI, and populates `policy_exclusions` in the response
+*   `_generate_business_summary` appends a plain-English policy notice when exclusions are active (e.g. *"Note: As per policy (rules.pdf), May month profit/revenue ($2,500) is excluded from the above figures."*)
+
+**Modified:** `backend/app/services/chat_graph.py`
+*   Added `policy_context` field to `AgentState`
+*   New `_apply_business_rules_to_frames()` helper filters excluded months from every DataFrame before any stat agent or summary builder processes them
+*   `load_data_node` calls the rules service, applies filters, and stores `policy_context`
+*   `_gemini_conversational` accepts `policy_context` and injects it as the highest-priority context block so Gemini always mentions the exclusion
+*   `synthesis_node` passes `policy_context` to all Gemini call sites; non-Gemini fallback path also appends a policy footnote
+
+**How to use:** Upload your data file (CSV/Excel) and a policy PDF in the same session. The PDF just needs to contain natural language like *"exclude May month profit from calculations"*. All KPIs, charts, and chat answers will automatically exclude that data and flag it clearly.
 
 #### Task 6: Frontend Interface Components
 *   `ChatBubble.jsx`: Splits text contents on `[n]` patterns, styling them as superscript tags. Appends a card if `scratchpad_link` is present, allowing users to launch the visualization page.
